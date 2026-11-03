@@ -137,7 +137,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: notifier-terraform-plan
-          path: .
+          path: infra
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
