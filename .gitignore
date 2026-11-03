@@ -1,13 +1,32 @@
+
+# Environment secrets
 .env
 .env.*
 !.env.example
+
+# Terraform generated files
 .terraform/
 *.tfstate
 *.tfstate.*
-*.tfvars
+*.tfplan
+infra/tfplan
+infra/plan-review.txt
+
+# Python
 __pycache__/
 *.pyc
 venv/
+.venv/
+
+# Application logs
 log_celery.txt
+*.log
+
+# AWS CLI installation files
 aws/
 awscliv2.zip
+
+# Terraform variable files and local OS files
+*.tfvars
+*.tfvars.json
+.DS_Store

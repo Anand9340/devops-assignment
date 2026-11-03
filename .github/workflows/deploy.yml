@@ -3,30 +3,36 @@ name: Deploy
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
-  id-token: write
   contents: read
+  id-token: write
 
 concurrency:
-  group: deploy
+  group: notifier-production-deploy
   cancel-in-progress: false
 
 env:
   AWS_REGION: ap-south-1
-  PROJECT: notifier
+  ECR_REPOSITORY: notifier
+  ECS_CLUSTER: notifier
+  FRONTEND_BUCKET: notifier-frontend-977133951325
+  CLOUDFRONT_DISTRIBUTION_ID: E3TRI5PVVY0KA6
+  APP_URL: https://d3igdflvatkly.cloudfront.net
 
 jobs:
-  deploy:
+  prepare:
+    name: Validate, Build and Create Terraform Plan
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials using OIDC
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
@@ -35,60 +41,148 @@ jobs:
       - name: Verify AWS identity
         run: aws sts get-caller-identity
 
-      - name: Setup Terraform
+      - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_wrapper: false
 
-      - name: Terraform init
-        run: terraform -chdir=infra init -backend-config=backend.hcl
+      - name: Terraform format check
+        run: terraform -chdir=infra fmt -check -recursive
 
-      - name: Login to Amazon ECR
+      - name: Terraform initialize
+        run: terraform -chdir=infra init -input=false -backend-config=backend.hcl
+
+      - name: Terraform validate
+        run: terraform -chdir=infra validate
+
+      - name: Log in to Amazon ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push Docker image
         env:
-          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          IMAGE="$REGISTRY/$PROJECT"
-          docker build -t "$IMAGE:$IMAGE_TAG" ./backend
-          docker push "$IMAGE:$IMAGE_TAG"
+          docker build \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            ./backend
 
-      - name: Terraform plan
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Create Terraform plan
+        env:
+          IMAGE_TAG: ${{ github.sha }}
         run: |
           terraform -chdir=infra plan \
-            -var="image_tag=${{ github.sha }}" \
+            -input=false \
+            -var="image_tag=$IMAGE_TAG" \
             -out=tfplan
 
-      - name: Terraform apply
-        run: terraform -chdir=infra apply -input=false tfplan
+      - name: Upload Terraform plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: notifier-terraform-plan
+          path: infra/tfplan
+          retention-days: 1
 
-      - name: Publish frontend
+  deploy:
+    name: Apply Infrastructure and Deploy Application
+    needs: prepare
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download Terraform plan
+        uses: actions/download-artifact@v4
+        with:
+          name: notifier-terraform-plan
+          path: .
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform initialize
+        run: terraform -chdir=infra init -input=false -backend-config=backend.hcl
+
+      - name: Apply saved Terraform plan
+        run: terraform -chdir=infra apply -input=false -auto-approve tfplan
+
+      - name: Deploy frontend to S3
         run: |
-          BUCKET=$(terraform -chdir=infra output -raw frontend_bucket)
-          DIST=$(terraform -chdir=infra output -raw cloudfront_distribution_id)
+          test -d frontend
+          aws s3 sync frontend/ "s3://$FRONTEND_BUCKET/" --delete
 
-          aws s3 sync frontend/ "s3://$BUCKET" \
-            --delete \
-            --cache-control "no-cache"
-
+      - name: Invalidate CloudFront cache
+        run: |
           aws cloudfront create-invalidation \
-            --distribution-id "$DIST" \
-            --paths "/index.html" "/"
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths "/*"
 
-      - name: Verify ECS services
+      - name: Wait for ECS services
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services backend worker
+
+      - name: Verify ECS service status
         run: |
           aws ecs describe-services \
-            --cluster notifier \
+            --cluster "$ECS_CLUSTER" \
             --services backend worker \
-            --region "$AWS_REGION" \
-            --query 'services[].{name:serviceName,running:runningCount,desired:desiredCount,status:status}' \
-            --output table
+            --output json > ecs-services.json
 
-      - name: Smoke test
+          python3 - <<'PY'
+          import json
+          import sys
+
+          with open("ecs-services.json") as f:
+              result = json.load(f)
+
+          services = result.get("services", [])
+
+          if len(services) != 2:
+              print("ERROR: Expected two ECS services.")
+              sys.exit(1)
+
+          for service in services:
+              name = service["serviceName"]
+              status = service["status"]
+              desired = service["desiredCount"]
+              running = service["runningCount"]
+
+              print(
+                  f"{name}: status={status}, "
+                  f"desired={desired}, running={running}"
+              )
+
+              if status != "ACTIVE" or running != desired:
+                  print(f"ERROR: {name} is not healthy.")
+                  sys.exit(1)
+
+          print("ECS service verification passed.")
+          PY
+
+      - name: Run application smoke test
         run: |
-          APP=$(terraform -chdir=infra output -raw app_url)
-          ./scripts/smoke_test.sh "$APP"
+          chmod +x scripts/smoke_test.sh
+          ./scripts/smoke_test.sh "$APP_URL"
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "## Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Region: $AWS_REGION" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ECS Cluster: $ECS_CLUSTER" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Application: $APP_URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
 
