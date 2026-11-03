@@ -129,7 +129,7 @@ data "aws_iam_policy_document" "trust" {
       variable = "token.actions.githubusercontent.com:sub"
 
       values = [
-        "repo:${var.github_repo}:ref:refs/heads/main"
+        "repo:Anand9340@199924066/devops-assignment@1444070381:ref:refs/heads/main"
       ]
     }
   }
