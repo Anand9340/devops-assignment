@@ -58,7 +58,7 @@ resource "aws_elasticache_replication_group" "redis" {
 
 # Redis connection URL
 locals {
-  redis_url = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/0"
+  redis_url = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/0?ssl_cert_reqs=required"
 }
 
 # ECS Redis connection secret
