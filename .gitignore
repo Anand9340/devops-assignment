@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+__pycache__/
+*.pyc
+venv/
+log_celery.txt
+aws/
+awscliv2.zip

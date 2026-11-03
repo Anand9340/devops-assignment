@@ -1,0 +1,94 @@
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  PROJECT: notifier
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: terraform -chdir=infra init -backend-config=backend.hcl
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE="$REGISTRY/$PROJECT"
+          docker build -t "$IMAGE:$IMAGE_TAG" ./backend
+          docker push "$IMAGE:$IMAGE_TAG"
+
+      - name: Terraform plan
+        run: |
+          terraform -chdir=infra plan \
+            -var="image_tag=${{ github.sha }}" \
+            -out=tfplan
+
+      - name: Terraform apply
+        run: terraform -chdir=infra apply -input=false tfplan
+
+      - name: Publish frontend
+        run: |
+          BUCKET=$(terraform -chdir=infra output -raw frontend_bucket)
+          DIST=$(terraform -chdir=infra output -raw cloudfront_distribution_id)
+
+          aws s3 sync frontend/ "s3://$BUCKET" \
+            --delete \
+            --cache-control "no-cache"
+
+          aws cloudfront create-invalidation \
+            --distribution-id "$DIST" \
+            --paths "/index.html" "/"
+
+      - name: Verify ECS services
+        run: |
+          aws ecs describe-services \
+            --cluster notifier \
+            --services backend worker \
+            --region "$AWS_REGION" \
+            --query 'services[].{name:serviceName,running:runningCount,desired:desiredCount,status:status}' \
+            --output table
+
+      - name: Smoke test
+        run: |
+          APP=$(terraform -chdir=infra output -raw app_url)
+          ./scripts/smoke_test.sh "$APP"
+
